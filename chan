@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""
+迅优 MZ803 移动路由 WiFi 信道优化工具
+扫描周围网络，分析拥堵情况，自动切换最佳信道
+
+用法:
+  ./chan                          单次扫描 + 交互式切换信道
+  ./chan --watch                  持续监控
+  ./chan --auto                   自动切换到最佳信道
+
+支持的路由器:
+  迅优 MZ803 (CN1, http://192.168.100.1)
+"""
+
+import subprocess
+import re
+import sys
+import time
+import os
+import json
+import urllib.request
+import urllib.parse
+from datetime import datetime
+import http.cookiejar
+import configparser
+import os.path
+
+# 全局 cookie，避免重复登录
+_cookie_jar = http.cookiejar.CookieJar()
+_opener = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(_cookie_jar)
+)
+
+AIRPORT = "/System/Library/PrivateFrameworks/Apple80211.framework/" \
+          "Versions/A/Resources/airport"
+
+# ── 路由器配置 ──────────────────────────────────────────
+
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+
+def load_config():
+    """读取 config.ini，不存在则交互创建"""
+    config = configparser.ConfigParser()
+    if os.path.exists(CONFIG_FILE):
+        config.read(CONFIG_FILE)
+        if config.has_section("router") and config.has_option("router", "url") and config.has_option("router", "password"):
+            return config
+
+    print("首次使用，请配置路由器信息")
+    url = input("管理地址 (默认 http://192.168.100.1): ").strip() or "http://192.168.100.1"
+    pwd = input("管理密码: ").strip()
+    while not pwd:
+        pwd = input("密码不能为空: ").strip()
+
+    config.add_section("router")
+    config["router"]["url"] = url
+    config["router"]["password"] = pwd
+
+    with open(CONFIG_FILE, "w") as f:
+        config.write(f)
+    print(f"已保存到 {CONFIG_FILE}")
+    return config
+
+# ── 扫描 ──────────────────────────────────────────────────
+
+def scan():
+    """调用 airport -s，返回网络列表"""
+    try:
+        out = subprocess.check_output([AIRPORT, "-s"],
+                                      timeout=15,
+                                      stderr=subprocess.STDOUT)
+    except Exception as e:
+        print(f"扫描失败: {e}")
+        sys.exit(1)
+    return out.decode("utf-8", errors="replace")
+
+
+def scan_self():
+    """获取当前连接信息"""
+    try:
+        out = subprocess.check_output([AIRPORT, "-I"],
+                                      timeout=60,
+                                      stderr=subprocess.STDOUT)
+        return out.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def parse(text):
+    """解析 airport -s 输出为结构化数据"""
+    networks = []
+    lines = text.strip().split("\n")
+    if not lines:
+        return networks
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        parts = re.split(r'\s{3,}', line.strip(), maxsplit=1)
+        if len(parts) != 2:
+            continue
+        ssid, rest = parts
+        fields = rest.split()
+        if len(fields) < 5:
+            continue
+        rssi = int(fields[0])
+        ch_raw = fields[1]
+        ht = fields[2]
+        cc = fields[3]
+        security = " ".join(fields[4:])
+        primary_ch = int(ch_raw.split(",")[0])
+        networks.append({
+            "ssid": ssid,
+            "rssi": rssi,
+            "channel": primary_ch,
+            "ch_raw": ch_raw,
+            "band": "2.4G" if primary_ch <= 14 else "5G",
+            "ht": ht,
+            "cc": cc,
+            "security": security,
+        })
+    return networks
+
+
+def get_connected_info():
+    """获取当前连接的 WiFi 信息"""
+    raw = scan_self()
+    info = {"ssid": "", "channel": 0, "rssi": 0}
+    for line in raw.split("\n"):
+        if "SSID:" in line and "BSSID" not in line:
+            info["ssid"] = line.split("SSID:")[-1].strip()
+        if "channel:" in line:
+            try:
+                info["channel"] = int(line.split("channel:")[-1].split(",")[0].strip())
+            except ValueError:
+                pass
+        if "agrCtlRSSI:" in line:
+            try:
+                info["rssi"] = int(line.split("agrCtlRSSI:")[-1].strip())
+            except ValueError:
+                pass
+    return info
+
+
+# ── 分析 ──────────────────────────────────────────────────
+
+def overlap_24g(a, b):
+    """2.4GHz 信道重叠系数"""
+    d = abs(a - b)
+    if d == 0:
+        return 1.0
+    elif d == 1:
+        return 0.5
+    elif d == 2:
+        return 0.25
+    return 0.0
+
+
+def analyze(networks, exclude_ssid=None):
+    """按频段分析信道拥堵情况"""
+    bands = {"2.4G": {}, "5G": {}}
+
+    # 排除自己的 WiFi（自己不干扰自己）
+    filtered = [n for n in networks if n["ssid"] != exclude_ssid] if exclude_ssid else networks
+
+    by_channel = {}
+    for n in filtered:
+        by_channel.setdefault((n["band"], n["channel"]), []).append(n)
+
+    for band in ["2.4G", "5G"]:
+        ch_range = range(1, 14) if band == "2.4G" else range(36, 200)
+        for ch in ch_range:
+            same_ch = by_channel.get((band, ch), [])
+            if band == "2.4G":
+                score = 0
+                for other_ch in ch_range:
+                    w = overlap_24g(ch, other_ch)
+                    if w == 0:
+                        continue
+                    for n in by_channel.get((band, other_ch), []):
+                        score += abs(n["rssi"]) * w
+                bands[band][ch] = {
+                    "count": len(same_ch),
+                    "score": round(score, 1),
+                    "rssi_range": _rssi_range(same_ch),
+                    "nets": same_ch,
+                }
+            else:
+                if len(same_ch) > 0:
+                    score = sum(abs(n["rssi"]) for n in same_ch)
+                    bands[band][ch] = {
+                        "count": len(same_ch),
+                        "score": score,
+                        "rssi_range": _rssi_range(same_ch),
+                        "nets": same_ch,
+                    }
+    return bands
+
+
+def _rssi_range(nets):
+    if not nets:
+        return None
+    rssis = [n["rssi"] for n in nets]
+    return f"{min(rssis)} ~ {max(rssis)}"
+
+
+def recommend(bands, band):
+    """推荐最佳信道"""
+    group = bands.get(band, {})
+    if not group:
+        return None, None
+    sorted_ch = sorted(group.items(), key=lambda x: x[1]["score"])
+    if sorted_ch:
+        return sorted_ch[0][0], sorted_ch[0][1]
+    return None, None
+
+
+# ── 路由器自动切换 ──────────────────────────────────
+
+def router_login(url, password):
+    """登录路由器"""
+    try:
+        pwd_b64 = urllib.parse.quote(base64_encode(password))
+        data = f"goformId=LOGIN&password={pwd_b64}"
+        req = urllib.request.Request(
+            f"{url}/reqproc/proc_post",
+            data.encode(),
+            {"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        resp = json.loads(_opener.open(req, timeout=60).read())
+        return resp.get("result") == "0"
+    except Exception as e:
+        print(f"  登录失败: {e}")
+        return False
+
+
+def router_set_channel(url, channel):
+    """设置路由器信道"""
+    try:
+        data = urllib.parse.urlencode({
+            "goformId": "SET_WIFI_INFO",
+            "wifi_band": "b",
+            "selectedChannel": str(channel),
+            "wifiMode": "b",
+            "countryCode": "CN",
+            "MAX_Access_num": "10",
+            "m_MAX_Access_num": "10",
+            "abg_rate": "0",
+            "wifi_11n_cap": "1",
+        })
+        req = urllib.request.Request(
+            f"{url}/reqproc/proc_post",
+            data.encode(),
+            {"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        resp = json.loads(_opener.open(req, timeout=60).read())
+        return resp.get("result") == "success"
+    except Exception as e:
+        print(f"  设置信道失败: {e}")
+        return False
+
+
+def base64_encode(s):
+    """简易 base64 编码"""
+    import base64
+    return base64.b64encode(s.encode()).decode()
+
+
+# ── 输出 ──────────────────────────────────────────────────
+
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+CYAN = "\033[96m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def _score_color(score, band):
+    if score == 0:
+        return GREEN
+    if band == "2.4G":
+        if score < 100:
+            return GREEN
+        elif score < 200:
+            return YELLOW
+        return RED
+    else:
+        if score < 50:
+            return GREEN
+        elif score < 100:
+            return YELLOW
+        return RED
+
+
+def display(bands, connected=None):
+    """显示信道分析报告"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n{BOLD}WiFi 信道分析报告  {now}{RESET}")
+    print("═" * 55)
+
+    for band, label in [("2.4G", "2.4GHz 频段"), ("5G", "5GHz 频段")]:
+        group = bands.get(band, {})
+        if not group:
+            continue
+
+        best_ch, best_info = recommend(bands, band)
+
+        print(f"\n{CYAN}{label}{RESET}")
+        print("-" * 55)
+        print(f"  {'信道':>4}  {'网络数':>6}  {'干扰分':>7}  {'信号范围':>12}")
+        print("-" * 55)
+
+        for ch in sorted(group.keys()):
+            info = group[ch]
+            score = info["score"]
+            count = info["count"]
+            rssi_r = info.get("rssi_range") or "--"
+
+            is_current = connected and connected["channel"] == ch
+            is_best = (ch == best_ch)
+
+            if is_best:
+                marker = f"  {GREEN}⬅ 推荐{RESET}"
+                if is_current:
+                    marker = f"  {GREEN}⬅ 推荐 (当前){RESET}"
+            elif is_current:
+                marker = f"  {CYAN}← 当前{RESET}"
+            else:
+                marker = ""
+
+            color = _score_color(score, band)
+            ch_display = f"{color}{ch:>4}{RESET}" if is_best else f"{ch:>4}"
+            score_display = f"{color}{score:>7.1f}{RESET}"
+
+            print(f"  {ch_display}  {count:>6}  {score_display}  {rssi_r:>12}{marker}")
+
+    # 当前连接信息
+    if connected and connected["ssid"]:
+        print(f"\n{CYAN}当前连接: {connected['ssid']} | "
+              f"信道 {connected['channel']} | "
+              f"RSSI {connected['rssi']} dBm{RESET}")
+    elif connected:
+        print(f"\n{YELLOW}当前未连接 WiFi{RESET}")
+
+    # 综合建议
+    print()
+    recoms = []
+    for band, label in [("2.4G", "2.4GHz"), ("5G", "5GHz")]:
+        ch, info = recommend(bands, band)
+        if ch:
+            recoms.append(f"{label} → {GREEN}信道 {ch}{RESET} (干扰分 {info['score']})")
+    if recoms:
+        print(f"{BOLD}建议:{RESET}  {' | '.join(recoms)}")
+    print()
+
+
+# ── 流量检测 ────────────────────────────────────────
+
+IDLE_THRESHOLD = 500  # B/s，低于此值视为空闲
+
+def get_thrpt():
+    """查询路由器当前上下行速率 (B/s)"""
+    try:
+        resp = urllib.request.urlopen(
+            "http://192.168.100.1/reqproc/proc_get"
+            "?cmd=realtime_rx_thrpt,realtime_tx_thrpt&multi_data=1",
+            timeout=60
+        )
+        data = json.loads(resp.read())
+        rx = int(data.get("realtime_rx_thrpt", 0))
+        tx = int(data.get("realtime_tx_thrpt", 0))
+        return rx, tx
+    except Exception:
+        return None, None
+
+
+def fmt_speed(b):
+    """将 B/s 转成人性化单位"""
+    if b >= 1024 * 1024:
+        return f"{b / 1024 / 1024:.1f}MB/s"
+    elif b >= 1024:
+        return f"{b / 1024:.1f}KB/s"
+    return f"{b}B/s"
+
+
+def check_idle(rx, tx):
+    """检查是否空闲，返回 (是否空闲, 说明)"""
+    if rx is None or tx is None:
+        return True, "无法查询流量，直接切换"
+    r = f"↓{fmt_speed(rx)} ↑{fmt_speed(tx)}"
+    if rx > IDLE_THRESHOLD or tx > IDLE_THRESHOLD:
+        return False, f"流量活跃 ({r})，跳过切换"
+    return True, f"空闲 ({r})"
+
+
+# ── 自动切换流程 ──────────────────────────────────
+
+def do_auto_switch(bands, net_name):
+    """自动切换到最佳信道"""
+    config = load_config()
+    if not config.has_section("router"):
+        print(f"{RED}未配置路由器信息{RESET}")
+        return False
+
+    url = config["router"]["url"]
+    password = config["router"]["password"]
+
+    # 只分析 2.4GHz（CN1 是 2.4G 设备）
+    best_ch, best_info = recommend(bands, "2.4G")
+    if not best_ch:
+        print(f"{RED}无法确定最佳信道{RESET}")
+        return False
+
+    connected = get_connected_info()
+    cur_ch = connected["channel"]
+    cur_score = bands.get("2.4G", {}).get(cur_ch, {}).get("score", 0)
+
+    if cur_score is not None and cur_score < 100:
+        print(f"  当前信道 {cur_ch} 干扰分 {cur_score}，良好无需切换")
+        return True
+
+    if cur_ch == best_ch:
+        print(f"  已在最佳信道 {best_ch}，无需切换")
+        return True
+
+    # 切换前检查流量，避免打断正在用的连接
+    rx, tx = get_thrpt()
+    idle, msg = check_idle(rx, tx)
+    if not idle:
+        print(f"  {YELLOW}{msg}{RESET}")
+        return False
+    if rx is not None:
+        print(f"  {msg}")
+
+    print(f"  登录路由器 {url} ... ", end="", flush=True)
+    if not router_login(url, password):
+        print(f"{RED}失败{RESET}")
+        return False
+    print(f"{GREEN}OK{RESET}")
+
+    print(f"  切换信道 {connected['channel']} → {GREEN}{best_ch}{RESET} ... ", end="", flush=True)
+    if not router_set_channel(url, best_ch):
+        print(f"{RED}失败{RESET}")
+        return False
+    print(f"{GREEN}OK{RESET}")
+
+    # 等待 WiFi 重连
+    print(f"  等待连接恢复...", end="", flush=True)
+    for i in range(15):
+        time.sleep(1)
+        info = get_connected_info()
+        if info["channel"] == best_ch and info["ssid"] == net_name:
+            print(f" {GREEN}已连接 (信道 {best_ch}, RSSI {info['rssi']} dBm){RESET}")
+            return True
+        print(".", end="", flush=True)
+    print(f" {YELLOW}超时，但信道已切换{RESET}")
+    return True
+
+
+# ── 主流程 ────────────────────────────────────────────────
+
+def main():
+    watch = False
+    auto = False
+    net_name = None
+    interval = 60
+
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--watch", "-w"):
+            watch = True
+            auto = True
+            if i + 1 < len(args) and args[i+1].isdigit():
+                i += 1
+                interval = int(args[i])
+        elif arg in ("--auto", "-a"):
+            auto = True
+        elif arg in ("--interval", "-i"):
+            if i + 1 < len(args):
+                i += 1
+                interval = int(args[i])
+        elif arg in ("--help", "-h"):
+            print("用法: ./chan [选项]")
+            print("  无参数         扫描分析 + 交互式切换信道")
+            print("  --watch, -w    自动切换 + 持续监控（默认每 15 分钟）")
+            print("  --watch <秒>   指定监控刷新间隔")
+            print("  --interval, -i <秒>  设置监控间隔")
+            print("  --auto, -a     自动切换到最佳信道（一次性）")
+            print("  --help, -h     显示帮助")
+            sys.exit(0)
+        i += 1
+
+    if auto:
+        # 执行一次扫描分析 + 自动切换
+        connected = get_connected_info()
+        net_name = connected["ssid"]
+
+        print(f"{BOLD}WiFi 信道分析 + 自动切换{RESET}")
+        print("═" * 40)
+        print(f"连接: {net_name}")
+        print()
+
+        raw = scan()
+        nets = parse(raw)
+        bands = analyze(nets, net_name)
+        display(bands, connected)
+
+        if net_name:
+            print(f"{BOLD}自动切换:{RESET}")
+            do_auto_switch(bands, net_name)
+        else:
+            print(f"{RED}未连接到已知路由器{RESET}")
+            sys.exit(1)
+
+    if watch:
+        try:
+            while True:
+                time.sleep(interval)
+                connected = get_connected_info()
+                raw = scan()
+                nets = parse(raw)
+                bands = analyze(nets, connected["ssid"])
+                display(bands, connected)
+                if connected["ssid"]:
+                    do_auto_switch(bands, connected["ssid"])
+        except KeyboardInterrupt:
+            print("\n已退出")
+            sys.exit(0)
+
+    if not auto and not watch:
+        connected = get_connected_info()
+        net_name = connected["ssid"]
+        raw = scan()
+        nets = parse(raw)
+        bands = analyze(nets, net_name)
+        display(bands, connected)
+
+        # 交互式切换
+        if net_name:
+            try:
+                inp = input(f"输入信道号切换 (回车跳过) → ").strip()
+                if inp:
+                    ch = int(inp)
+                    config = load_config()
+                    if config.has_section("router") and (1 <= ch <= 13):
+                        url = config["router"]["url"]
+                        pwd = config["router"]["password"]
+                        print(f"\n{BOLD}切换到信道 {ch}:{RESET}")
+                        if not router_login(url, pwd):
+                            print(f"  {RED}登录失败{RESET}")
+                        elif not router_set_channel(url, ch):
+                            print(f"  {RED}切换失败{RESET}")
+                        else:
+                            print(f"  等待重连...", end="", flush=True)
+                            for i in range(15):
+                                time.sleep(1)
+                                info = get_connected_info()
+                                if info["channel"] == ch:
+                                    print(f" {GREEN}已连接 (信道 {ch}, RSSI {info['rssi']} dBm){RESET}")
+                                    break
+                            else:
+                                print(f" {YELLOW}超时，但信道已切换{RESET}")
+                    else:
+                        print(f"  {YELLOW}无效信道或未配置该路由器{RESET}")
+            except ValueError:
+                print(f"  {YELLOW}已跳过{RESET}")
+            except EOFError:
+                pass
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# 迅优 MZ803 APN 管理工具
+# 用法: ./apn             交互式 APN 管理
+#       ./apn --test/-t   遍历所有 APN 测速排序
+
+# ── 配置 ────────────────────────────────────────────────
+CONFIG_FILE="$(dirname "$0")/config.ini"
+if [ -f "$CONFIG_FILE" ]; then
+    URL=$(grep "^url" "$CONFIG_FILE" | cut -d= -f2 | tr -d ' ')
+    PASSWORD=$(grep "^password" "$CONFIG_FILE" | cut -d= -f2 | tr -d ' ')
+fi
+if [ -z "$URL" ] || [ -z "$PASSWORD" ]; then
+    echo "首次使用，请配置路由器信息"
+    read -r -p "管理地址 (默认 http://192.168.100.1): " inp
+    URL="${inp:-http://192.168.100.1}"
+    read -r -p "管理密码: " inp
+    while [ -z "$inp" ]; do
+        read -r -p "管理密码: " inp
+    done
+    PASSWORD="$inp"
+    echo "[router]" > "$CONFIG_FILE"
+    echo "url = $URL" >> "$CONFIG_FILE"
+    echo "password = $PASSWORD" >> "$CONFIG_FILE"
+    echo "已保存到 $CONFIG_FILE"
+fi
+PWD_B64=$(echo -n "$PASSWORD" | base64)
+SPEEDTEST="$(dirname "$0")/speedtest"
+[ -x "$SPEEDTEST" ] || SPEEDTEST="/tmp/speedtest"
+
+GREEN='\033[92m'
+CYAN='\033[96m'
+BOLD='\033[1m'
+RED='\033[91m'
+YELLOW='\033[93m'
+RESET='\033[0m'
+
+APN_LIST=(
+  "ctlte:中国电信 LTE"
+  "ctnet:中国电信 NET"
+  "3gnet:中国联通 3G/4G"
+  "uninet:中国联通 NET"
+  "uniwap:中国联通 WAP"
+  "cmnet:中国移动 NET"
+  "cmwap:中国移动 WAP"
+)
+
+# ── 通用 ────────────────────────────────────────────────
+
+router_login() {
+    curl -s "$URL/reqproc/proc_post" \
+        --data "goformId=LOGIN&password=$PWD_B64" | grep -q '"result":"0"'
+}
+
+router_get_apn() {
+    curl -s "$URL/reqproc/proc_get?cmd=wan_apn,apn_mode,ppp_status,apn_index,m_profile_name,pdp_type&multi_data=1"
+}
+
+# ── APN 管理（默认模式）────────────────────────────────
+
+cmd_manage() {
+    local json
+    # 先登录再查询
+    router_login > /dev/null
+    json=$(router_get_apn)
+    local wan_apn apn_mode ppp_status profile
+    wan_apn=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('wan_apn',''))" 2>/dev/null)
+    apn_mode=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('apn_mode',''))" 2>/dev/null)
+    ppp_status=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ppp_status',''))" 2>/dev/null)
+    profile=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('m_profile_name',''))" 2>/dev/null)
+
+    echo -e "\n${BOLD}APN 管理${RESET}"
+    echo "════════════════════════════════════════"
+    echo -e "当前 APN:   ${GREEN}${wan_apn:-N/A}${RESET}"
+    echo "配置名称:   ${profile:-N/A}"
+    echo -e "APN 模式:   ${apn_mode:-N/A}"
+    echo -e "连接状态:   ${ppp_status:-N/A}"
+    echo ""
+
+    echo -e "${CYAN}可选 APN:${RESET}"
+    printf "  %2s  %-12s  %s\n" "#" "APN" "说明"
+    echo "  -----------------------------------"
+    local i=1
+    for row in "${APN_LIST[@]}"; do
+        local apn="${row%%:*}"
+        local name="${row##*:}"
+        local marker=""
+        [ "$apn" = "$wan_apn" ] && marker=" ${GREEN}⬅ 当前${RESET}"
+        printf "  %2d  %-12s  %s${marker}\n" "$i" "$apn" "$name"
+        i=$((i + 1))
+    done
+    printf "  %2s  %-12s  自动模式（恢复 SIM 卡默认）\n" "" "auto"
+
+    echo ""
+    read -r -p "输入序号或 APN 名称切换 (回车跳过) → " inp
+    [ -z "$inp" ] && return
+
+    if [ "$inp" = "auto" ]; then
+        echo -en "\n  恢复自动模式... "
+        router_login && curl -s "$URL/reqproc/proc_post" \
+            --data-urlencode "goformId=APN_PROC_EX" \
+            --data-urlencode "apn_mode=auto" > /dev/null \
+            && echo -e "${GREEN}OK${RESET}" || echo -e "${RED}失败${RESET}"
+        return
+    fi
+
+    local selected_apn="" selected_name=""
+    if [[ "$inp" =~ ^[0-9]+$ ]]; then
+        local idx=$((inp - 1))
+        if [ "$idx" -ge 0 ] && [ "$idx" -lt "${#APN_LIST[@]}" ]; then
+            local row="${APN_LIST[$idx]}"
+            selected_apn="${row%%:*}"
+            selected_name="${row##*:}"
+        fi
+    else
+        for row in "${APN_LIST[@]}"; do
+            local a="${row%%:*}"
+            if [ "${inp,,}" = "${a,,}" ]; then
+                selected_apn="$a"
+                selected_name="${row##*:}"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$selected_apn" ]; then
+        echo -e "  ${YELLOW}无效选择${RESET}"
+        return
+    fi
+
+    echo -en "\n  切换到 ${selected_name} (${selected_apn}) ... "
+    if router_login && \
+       curl -s "$URL/reqproc/proc_post" \
+        --data-urlencode "goformId=APN_PROC_EX" \
+        --data-urlencode "apn_action=save" \
+        --data-urlencode "apn_mode=manual" \
+        --data-urlencode "profile_name=${selected_name}" \
+        --data-urlencode "wan_dial=*99#" \
+        --data-urlencode "pdp_type=IP" \
+        --data-urlencode "wan_apn=${selected_apn}" \
+        --data-urlencode "ppp_auth_mode=None" \
+        --data-urlencode "index=1" > /dev/null && \
+       curl -s "$URL/reqproc/proc_post" \
+        --data-urlencode "goformId=APN_PROC_EX" \
+        --data-urlencode "apn_action=set_default" \
+        --data-urlencode "apn_mode=manual" \
+        --data-urlencode "set_default_flag=1" \
+        --data-urlencode "pdp_type=IP" \
+        --data-urlencode "index=1" > /dev/null; then
+        echo -e "${GREEN}OK${RESET}"
+        sleep 3
+        local info
+        info=$(router_get_apn)
+        local new_apn
+        new_apn=$(echo "$info" | python3 -c "import sys,json; print(json.load(sys.stdin).get('wan_apn',''))" 2>/dev/null)
+        local new_status
+        new_status=$(echo "$info" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ppp_status',''))" 2>/dev/null)
+        echo -e "  当前 APN: ${GREEN}${new_apn}${RESET} | 连接: ${new_status}"
+    else
+        echo -e "${RED}失败${RESET}"
+    fi
+}
+
+# ── 测速模式 ────────────────────────────────────────────
+
+cmd_test() {
+    local RESULTS=()
+
+    switch_apn() {
+        local apn=$1 name=$2
+        router_login > /dev/null
+        curl -s "$URL/reqproc/proc_post" \
+            --data-urlencode "goformId=APN_PROC_EX" \
+            --data-urlencode "apn_action=save" \
+            --data-urlencode "apn_mode=manual" \
+            --data-urlencode "profile_name=$name" \
+            --data-urlencode "wan_dial=*99#" \
+            --data-urlencode "pdp_type=IP" \
+            --data-urlencode "wan_apn=$apn" \
+            --data-urlencode "ppp_auth_mode=None" \
+            --data-urlencode "index=1" > /dev/null
+        curl -s "$URL/reqproc/proc_post" \
+            --data-urlencode "goformId=APN_PROC_EX" \
+            --data-urlencode "apn_action=set_default" \
+            --data-urlencode "apn_mode=manual" \
+            --data-urlencode "set_default_flag=1" \
+            --data-urlencode "pdp_type=IP" \
+            --data-urlencode "index=1" > /dev/null
+        sleep 5
+    }
+
+    echo "APN 测速中，请等待..."
+    echo "======================"
+    echo ""
+
+    for row in "${APN_LIST[@]}"; do
+        local apn="${row%%:*}"
+        local name="${row##*:}"
+
+        echo -n "[$apn] $name ... "
+        switch_apn "$apn" "$name"
+
+        local status
+        status=$(curl -s "$URL/reqproc/proc_get?cmd=ppp_status&multi_data=1")
+
+        if echo "$status" | grep -q "ppp_connected"; then
+            local json
+            json=$($SPEEDTEST -f json --progress=no --accept-license --accept-gdpr 2>/dev/null)
+            if [ -n "$json" ]; then
+                local dl ul lat
+                dl=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print('%.2f' % (d['download']['bandwidth']*8/1e6))" 2>/dev/null)
+                ul=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print('%.2f' % (d['upload']['bandwidth']*8/1e6))" 2>/dev/null)
+                lat=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print('%.2f' % d['ping']['latency'])" 2>/dev/null)
+                [ -z "$dl" ] && dl="0"; [ -z "$ul" ] && ul="0"; [ -z "$lat" ] && lat="0"
+                echo "↓ ${dl} ↑ ${ul}"
+                RESULTS+=("$dl|$ul|$lat|$apn|$name")
+            else
+                echo "测速失败"
+                RESULTS+=("0|0|0|$apn|$name")
+            fi
+        else
+            echo -e "${RED}无法连接${RESET}"
+            RESULTS+=("0|0|0|$apn|$name")
+        fi
+    done
+
+    # 按下载排序
+    for ((i=0; i<${#RESULTS[@]}; i++)); do
+        for ((j=i+1; j<${#RESULTS[@]}; j++)); do
+            local dl_i dl_j
+            dl_i=$(echo "${RESULTS[$i]}" | cut -d'|' -f1)
+            dl_j=$(echo "${RESULTS[$j]}" | cut -d'|' -f1)
+            if (( $(echo "$dl_j > $dl_i" | bc -l 2>/dev/null) )); then
+                local tmp="${RESULTS[$i]}"
+                RESULTS[$i]="${RESULTS[$j]}"
+                RESULTS[$j]="$tmp"
+            fi
+        done
+    done
+
+    echo ""
+    echo "======================"
+    echo "     测速结果排名"
+    echo "======================"
+    echo ""
+    printf "  %-3s  %-12s  %-18s  %-10s  %-10s\n" "#" "APN" "运营商" "下载" "上传"
+    printf "  %s\n" "----------------------------------------------"
+    local rank=1
+    for r in "${RESULTS[@]}"; do
+        local dl ul apn name medal=""
+        dl=$(echo "$r" | cut -d'|' -f1)
+        ul=$(echo "$r" | cut -d'|' -f2)
+        apn=$(echo "$r" | cut -d'|' -f4)
+        name=$(echo "$r" | cut -d'|' -f5)
+        [ "$rank" = "1" ] && medal="🥇"
+        [ "$rank" = "2" ] && medal="🥈"
+        [ "$rank" = "3" ] && medal="🥉"
+        printf "  %-3s  %-12s  %-18s  %-8s  %-8s\n" "$medal" "$apn" "$name" "${dl} Mbps" "${ul} Mbps"
+        rank=$((rank + 1))
+    done
+    echo ""
+}
+
+# ── 国际连通性测试 ─────────────────────────────────────
+
+cmd_open() {
+    python3 "$(dirname "$0")/openness.py"
+}
+
+# ── 入口 ────────────────────────────────────────────────
+
+cd "$(dirname "$0")" 2>/dev/null
+
+case "${1:-}" in
+    --test|-t)
+        cmd_test
+        ;;
+    --open|-o)
+        cmd_open
+        ;;
+    --help|-h)
+        echo "用法: ./apn [选项]"
+        echo "  无参数        APN 管理（交互式切换）"
+        echo "  --test, -t    遍历所有 APN 测速排序"
+        echo "  --open, -o    测试国际连通性（GFW 封锁程度）"
+        echo "  --help, -h    显示帮助"
+        ;;
+    *)
+        cmd_manage
+        ;;
+esac
